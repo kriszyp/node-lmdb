@@ -1245,7 +1245,7 @@ describe('Node.js LMDB Bindings', function() {
       }, 100);
     });
   });
-  describe('batch', function() {
+  describe.only('batch', function() {
     this.timeout(10000);
     var env;
     before(function() {
@@ -1266,31 +1266,48 @@ describe('Node.js LMDB Bindings', function() {
         create: true
       });
       var data = [
-        [ dbi, Buffer.from([4]), Buffer.from([1, 2]) ],
+        [ dbi, Buffer.from([47]), Buffer.from([1, 2]), Buffer.from([5, 2]) ],
+        [ dbi, Buffer.from([4]), Buffer.from([1, 2]), Buffer.from([5, 2]) ],
         [ dbi, Buffer.from([5]), Buffer.from([3, 4]) ],
         [ dbi, Buffer.from([6]), Buffer.from([5, 6]) ],
-        [ dbi, Buffer.from([7]) ]
+        [ dbi, Buffer.from([7]) ],
+        [ dbi, Buffer.from([6]), Buffer.from([7, 8]), Buffer.from([1, 1]) ],
+        [ dbi, Buffer.from([6]), Buffer.from([7, 8]), Buffer.from([5]) ],
+        {
+          db: dbi,
+          key: Buffer.from([5]),
+          value: Buffer.from([8, 9]),
+          ifValue: Buffer.from([7]),
+          ifKey: Buffer.from([6]),
+          ifExactMatch: false,
+        }
+
       ];
-      env.batchWrite(data, { keyIsBuffer: true, ignoreNotFound: true }, function(error) {
+      env.batchWrite(data, { keyIsBuffer: true, ignoreNotFound: true, progress(results) {
+        console.log('progress', results)
+      } }, function(error, results) {
         if (error) {
           should.fail(error);
           return done();
         }
+        console.log('results',results, arguments.length)
 
         var txn = env.beginTxn();
         for (var i = 0; i < data.length; i++) {
           var key = data[i][1]
           var value = data[i][2]
-          //console.log('checking', key, txn.getBinary(dbi, key));
-          if (value)
+          if (key)
+            console.log('checking', key, txn.getBinary(dbi, key));
+          /*if (value)
             should.equal(value.equals(txn.getBinary(dbi, key)), true);
           else
-            should.equal(txn.getBinary(dbi, key), null);
+            should.equal(txn.getBinary(dbi, key), null);*/
         }
         txn.commit();
         dbi.close();
         done();
       });
+      console.log('submitted batch')
     });
     it('will batchWrite strings and read it', function(done) {
       var dbi = env.openDbi({
