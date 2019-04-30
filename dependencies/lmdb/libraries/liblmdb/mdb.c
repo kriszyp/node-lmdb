@@ -1305,6 +1305,8 @@ struct MDB_env {
 	int		me_live_reader;		/**< have liveness lock in reader table */
 #ifdef _WIN32
 	int		me_pidquery;		/**< Used in OpenProcess */
+	OVERLAPPED	*ov;			/**< Used for for overlapping I/O requests */
+	int		ovs;				/**< Count of OVERLAPPEDs */
 #endif
 #ifdef MDB_USE_POSIX_MUTEX	/* Posix mutexes reside in shared mem */
 #	define		me_rmutex	me_txns->mti_rmutex /**< Shared reader lock */
@@ -3311,7 +3313,7 @@ mdb_page_flush(MDB_txn *txn, int keep)
 	pgno_t		pgno = 0;
 	MDB_page	*dp = NULL;
 #ifdef _WIN32
-	OVERLAPPED	*ov;
+	OVERLAPPED	*ov = env->ov;
 	MDB_page	*wdp;
 	int async_i = 0;
 	HANDLE fd = (env->me_flags & MDB_NOSYNC) ? env->me_fd : env->me_ovfd;
@@ -3324,7 +3326,6 @@ mdb_page_flush(MDB_txn *txn, int keep)
 	int			n = 0;
 
 	j = i = keep;
-
 	if (env->me_flags & MDB_WRITEMAP
 #ifdef _WIN32
 		/* In windows, we still do writes to the file (with write-through enabled in sync mode),
@@ -3347,9 +3348,24 @@ mdb_page_flush(MDB_txn *txn, int keep)
 	}
 
 #ifdef _WIN32
-	ov = malloc((pagecount - keep) * sizeof(OVERLAPPED));
-	if (ov == NULL)
-		return ENOMEM;
+	if (pagecount - keep >= env->ovs) {
+		/* ran out of room in ov array, and re-malloc, copy handles and free previous */
+		int ovs = (pagecount - keep) * 1.5; /* provide extra padding to reduce number of re-allocations */
+		int new_size = ovs * sizeof(OVERLAPPED);
+		ov = malloc(new_size);
+		if (ov == NULL)
+			return ENOMEM;
+		int previous_size = env->ovs * sizeof(OVERLAPPED);
+		memcpy(ov, env->ov, previous_size); /* Copy previous OVERLAPPED data to retain event handles */
+		/* And clear rest of memory */
+		memset(&ov[env->ovs], 0, new_size - previous_size);
+		if (env->ovs > 0) {
+			free(env->ov); /* release previous allocation */
+		}
+
+		env->ov = ov;
+		env->ovs = ovs;
+	}
 #endif
 
 	/* Write the pages */
@@ -3360,9 +3376,6 @@ mdb_page_flush(MDB_txn *txn, int keep)
 			if (dp->mp_flags & (P_LOOSE|P_KEEP)) {
 				dp->mp_flags &= ~P_KEEP;
 				dl[i].mid = 0;
-#ifdef _WIN32
-				ov[i].hEvent = NULL; /* denote skipped page*/
-#endif
 				continue;
 			}
 			pgno = dl[i].mid;
@@ -3392,26 +3405,26 @@ retry_write:
 				/* Write previous page(s) */
 				DPRINTF(("committing page %"Z"u", pgno));
 #ifdef _WIN32
-				memset(&ov[async_i], 0, sizeof(OVERLAPPED));
-				ov[async_i].Offset = wpos & 0xffffffff;
-				ov[async_i].OffsetHigh = wpos >> 16 >> 16;
-				if (!F_ISSET(env->me_flags, MDB_NOSYNC)) {
-					HANDLE event = CreateEvent(NULL, TRUE, FALSE, NULL);
+				OVERLAPPED *this_ov = &ov[async_i];
+				/* Clear status, and keep hEvent, we reuse that */
+				this_ov->Internal = 0;
+				this_ov->Offset = wpos & 0xffffffff;
+				this_ov->OffsetHigh = wpos >> 16 >> 16;
+				if (!F_ISSET(env->me_flags, MDB_NOSYNC) && !this_ov->hEvent) {
+					HANDLE event = CreateEvent(NULL, FALSE, FALSE, NULL);
 					if (!event) {
 						rc = ErrCode();
 						DPRINTF(("CreateEvent: %s", strerror(rc)));
 						return rc;
 					}
-					ov[async_i].hEvent = event;
+					this_ov->hEvent = event;
 				}
-				if (!WriteFile(fd, wdp, wsize, NULL, &ov[async_i])) {
+				if (!WriteFile(fd, wdp, wsize, NULL, this_ov)) {
 					rc = ErrCode();
 					if (rc != ERROR_IO_PENDING) {
 						DPRINTF(("WriteFile: %d", rc));
 						return rc;
 					}
-				} else {
-fprintf(stderr, "WriteFile returned, no need for overlap results\n");
 				}
 				async_i++;
 #else
@@ -3469,20 +3482,20 @@ retry_seek:
 	if (!F_ISSET(env->me_flags, MDB_NOSYNC)) {
 		/* Now wait for all the asynchronous/overlapped sync/write-through writes to complete.
 		* We start with the last one so that all the others should already be complete and
-		* we reduce thread suspend/resuming */
+		* we reduce thread suspend/resuming (in practice, typically about 99.5% of writes are
+		* done after the last write is done) */
+		rc = 0;
 		while (--async_i >= 0) {
 			if (ov[async_i].hEvent) {
 				if (!GetOverlappedResult(fd, &ov[async_i], &wres, TRUE)) {
-					CloseHandle(ov[async_i].hEvent);
-					rc = ErrCode();
-					return rc;
+					rc = ErrCode(); /* Continue on so that all the event signals are reset */
 				}
-				CloseHandle(ov[async_i].hEvent);
 			}
 		}
-
+		if (rc) { /* any error on GetOverlappedResult, exit now */
+			return rc;
+		}
 	}
-	free(ov);
 #endif	/* _WIN32 */
 
 	if (!(env->me_flags & MDB_WRITEMAP)) {
@@ -4411,6 +4424,7 @@ mdb_env_open2(MDB_env *env)
 		env->me_pidquery = MDB_PROCESS_QUERY_LIMITED_INFORMATION;
 	else
 		env->me_pidquery = PROCESS_QUERY_INFORMATION;
+	env->ovs = 0;
 #endif /* _WIN32 */
 
 #ifdef BROKEN_FDATASYNC
@@ -5171,6 +5185,12 @@ mdb_env_close0(MDB_env *env, int excl)
 	if (env->me_mfd != INVALID_HANDLE_VALUE)
 		(void) close(env->me_mfd);
 #ifdef _WIN32
+	if (env->ovs > 0) {
+		for (i = 0; i < env->ovs; i++) {
+			CloseHandle(env->ov[i].hEvent);
+		}
+		free(env->ov);
+	}
 	if (env->me_ovfd != INVALID_HANDLE_VALUE)
 		(void) close(env->me_ovfd);
 #endif
